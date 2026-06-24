@@ -1,6 +1,6 @@
 {
   "name": "hoshi-web-search",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "description": "Pi coding agent extension providing web search and fetch tools with real browser user agents, visual parsing fallback, and SQLite response caching",
   "keywords": ["pi-package"],
   "license": "Apache-2.0",

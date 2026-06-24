@@ -1,5 +1,6 @@
 /**
- * Web fetch tool: fetches URLs with retry, SSRF protection, cache, and visual fallback.
+ * Web fetch tool: fetches URLs with retry, SSRF protection, cache, visual fallback,
+ * YouTube transcript detection, and detail mode support.
  */
 
 import { getConsistentUA } from "./user-agent.js";
@@ -9,40 +10,79 @@ import { rateLimitWait } from "./rate-limiter.js";
 import { isAllowedByRobots, getRobotsCrawlDelay } from "./robots.js";
 import { cacheGet, cacheSet, makeCacheKey } from "./cache.js";
 import { checkSSRF } from "./ssrf.js";
+import { loadConfig, type DetailMode } from "./config.js";
+import { isYouTubeUrl, fetchYouTubeTranscript } from "./youtube.js";
 
 export type FetchFormat = "markdown" | "text" | "html";
-export interface FetchResult { content: string; title: string | null; finalUrl: string; status: number; contentType: string; method: "fetch" | "visual"; screenshot?: string; cached?: boolean; }
+export interface FetchResult { content: string; title: string | null; finalUrl: string; status: number; contentType: string; method: "fetch" | "visual" | "youtube"; screenshot?: string; cached?: boolean; }
 
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 const MAX_RETRIES = 2;
 const RETRY_BASE_DELAY_MS = 1500;
 
-export interface WebFetchOptions { format?: FetchFormat; timeout?: number; signal?: AbortSignal; forceVisual?: boolean; respectRobots?: boolean; selector?: string; onProgress?: (message: string) => void; }
+export interface WebFetchOptions { format?: FetchFormat; timeout?: number; signal?: AbortSignal; forceVisual?: boolean; respectRobots?: boolean; selector?: string; detail?: DetailMode; onProgress?: (message: string) => void; }
 
 export async function webFetch(url: string, options: WebFetchOptions = {}): Promise<FetchResult> {
-  const { format = "markdown", timeout = 30000, signal, forceVisual = false, respectRobots = false, selector, onProgress } = options;
+  const config = loadConfig();
+  const { format = "markdown", timeout = config.httpTimeoutMs, signal, forceVisual = false, respectRobots = false, selector, onProgress } = options;
   if (signal?.aborted) throw new Error("Aborted");
+
   const ssrfError = await checkSSRF(url);
   if (ssrfError) throw new Error(ssrfError);
-  if (!forceVisual && format !== "html") { const ck = makeCacheKey("fetch", url, { format, selector }); const cached = cacheGet(ck); if (cached) { const p = JSON.parse(cached) as FetchResult; p.cached = true; return p; } }
-  if (respectRobots) { onProgress?.("Checking robots.txt..."); if (!(await isAllowedByRobots(url))) return { content: `[Blocked by robots.txt] ${url} is disallowed`, title: null, finalUrl: url, status: 0, contentType: "", method: "fetch" }; }
+
+  // YouTube special handling
+  if (isYouTubeUrl(url) && !forceVisual) {
+    onProgress?.("Extracting YouTube transcript...");
+    try {
+      const yt = await fetchYouTubeTranscript(url, signal);
+      const content = yt.hasTranscript
+        ? `# ${yt.title}\n\n${yt.transcript}`
+        : `# ${yt.title}\n\n_No transcript available. Video description:_\n\n${yt.transcript}`;
+      return { content, title: yt.title, finalUrl: url, status: 200, contentType: "text/plain", method: "youtube" };
+    } catch (err) {
+      onProgress?.(`YouTube extraction failed: ${err instanceof Error ? err.message : String(err)}, falling back to normal fetch...`);
+    }
+  }
+
+  // Cache check
+  if (!forceVisual && format !== "html") {
+    const ck = makeCacheKey("fetch", url, { format, selector });
+    const cached = cacheGet(ck);
+    if (cached) { const p = JSON.parse(cached) as FetchResult; p.cached = true; return p; }
+  }
+
+  if (respectRobots) {
+    onProgress?.("Checking robots.txt...");
+    if (!(await isAllowedByRobots(url))) return { content: `[Blocked by robots.txt] ${url} is disallowed`, title: null, finalUrl: url, status: 0, contentType: "", method: "fetch" };
+  }
+
   if (forceVisual) { onProgress?.("Rendering page in headless browser..."); return fetchVisual(url, timeout, signal); }
-  let delayMs = 1000;
+
+  // Rate limit with crawl-delay
+  let delayMs = config.rateLimitMs;
   if (respectRobots) { const cd = await getRobotsCrawlDelay(url); if (cd && cd > delayMs) delayMs = Math.min(cd, 10000); }
   await rateLimitWait(url, delayMs);
+
+  // Retry loop
   let lastError: Error | null = null;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (signal?.aborted) throw new Error("Aborted");
-    if (attempt > 0) { const d = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1); onProgress?.(`Retrying (${attempt + 1}/${MAX_RETRIES + 1}) after ${d}ms...`); await sleep(d); } else onProgress?.(`Fetching ${url}...`);
+    if (attempt > 0) { const d = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1); onProgress?.(`Retrying (${attempt + 1}/${MAX_RETRIES + 1}) after ${d}ms...`); await sleep(d); }
+    else onProgress?.(`Fetching ${url}...`);
     try {
       const result = await fetchStandard(url, format, timeout, signal, selector);
-      if (isUsableContent(result.content, result.status, result.contentType)) { if (format !== "html" && !result.screenshot) { try { cacheSet(makeCacheKey("fetch", url, { format, selector }), JSON.stringify(result)); } catch { /* */ } } return result; }
+      if (isUsableContent(result.content, result.status, result.contentType)) {
+        if (format !== "html" && !result.screenshot) { try { cacheSet(makeCacheKey("fetch", url, { format, selector }), JSON.stringify(result)); } catch {} }
+        return result;
+      }
       lastError = new Error("Content appears blocked or unusable");
     } catch (err) { lastError = err instanceof Error ? err : new Error(String(err)); }
   }
+
   onProgress?.("Text fetch failed, rendering page visually...");
   try { return await fetchVisual(url, timeout, signal); } catch (ve) { throw lastError || ve; }
 }
+
 
 async function fetchStandard(url: string, format: FetchFormat, timeout: number, signal?: AbortSignal, selector?: string): Promise<FetchResult> {
   const controller = new AbortController();
@@ -61,7 +101,7 @@ async function fetchStandard(url: string, format: FetchFormat, timeout: number, 
     const body = await readBodyLimited(response, MAX_RESPONSE_BYTES);
     if (!contentType.includes("html") && !contentType.includes("xml")) {
       let content = body;
-      if (contentType.includes("json")) { try { content = JSON.stringify(JSON.parse(body), null, 2); } catch { /* */ } }
+      if (contentType.includes("json")) { try { content = JSON.stringify(JSON.parse(body), null, 2); } catch {} }
       return { content, title: null, finalUrl, status: response.status, contentType, method: "fetch" };
     }
     const title = extractTitle(body);
@@ -97,5 +137,5 @@ function isUsableContent(content: string, status: number, contentType: string): 
   return true;
 }
 
-function isBinaryContentType(ct: string): boolean { const types = ["application/pdf","application/zip","application/gzip","application/octet-stream","application/x-tar","image/","video/","audio/","application/wasm"]; return types.some((t) => ct.toLowerCase().includes(t)); }
-function sleep(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)); }
+function isBinaryContentType(ct: string): boolean { return ["application/pdf","application/zip","application/gzip","application/octet-stream","application/x-tar","image/","video/","audio/","application/wasm"].some(t => ct.toLowerCase().includes(t)); }
+function sleep(ms: number): Promise<void> { return new Promise(r => setTimeout(r, ms)); }
